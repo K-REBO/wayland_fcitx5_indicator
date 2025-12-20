@@ -1,0 +1,23 @@
+[package]
+name = "modal"
+version = "0.1.0"
+edition = "2021"
+description = "IME mode indicator for fcitx5"
+
+[dependencies]
+anyhow = "1"
+cairo-rs = "0.20"
+
+# Wayland dependencies
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+memmap2 = "0.9"
+nix = { version = "0.29", features = ["fs", "mman"] }
+tempfile = "3"
+
+# DBus for fcitx5 monitoring
+dbus = "0.9"
+
+# Threading
+crossbeam-channel = "0.5"
