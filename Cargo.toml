@@ -1,5 +1,5 @@
 [package]
-name = "modal"
+name = "wayland_fcitx5_indicator"
 version = "0.1.0"
 edition = "2021"
 description = "IME mode indicator for fcitx5"
@@ -7,6 +7,8 @@ description = "IME mode indicator for fcitx5"
 [dependencies]
 anyhow = "1"
 cairo-rs = "0.20"
+ron = "0.8"
+serde = { version = "1", features = ["derive"] }
 
 # Wayland dependencies
 wayland-client = "0.31"
@@ -21,3 +23,15 @@ dbus = "0.9"
 
 # Threading
 crossbeam-channel = "0.5"
+
+# Hyprland IPC for active window detection
+hyprland = "0.4.0-beta.3"
+
+[profile.dev]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

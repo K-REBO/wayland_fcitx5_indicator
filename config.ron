@@ -1,0 +1,26 @@
+Config(
+    // 入力メソッドごとの表示テキスト
+    input_method_names: {
+        "mozc": "かな",
+        "keyboard-us": "en",
+    },
+
+    // オーバーレイの外観設定
+    overlay: OverlayConfig(
+        width: 200,
+        height: 100,
+        font_size: 48.0,
+    ),
+
+    // アニメーション設定
+    animation: AnimationConfig(
+        // 表示時間（ミリ秒）
+        display_duration_ms: 500,
+
+        // フェードアウト時間（ミリ秒）
+        fade_duration_ms: 400,
+
+        // フェードアウトのフレーム数
+        fade_frames: 20,
+    ),
+)

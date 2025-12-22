@@ -21,11 +21,32 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 
 use dbus::blocking::Connection as DbusConnection;
 use dbus::message::MatchRule;
+use crossbeam_channel::unbounded;
+use hyprland::data::Client;
+use hyprland::prelude::*;
+
+mod config;
+use config::Config;
 
 fn main() -> Result<()> {
     println!("=== fcitx5 IME Mode Indicator (Daemon) ===\n");
     println!("fcitx5の入力メソッド変更を監視しています...");
     println!("終了するには Ctrl+C を押してください\n");
+
+    // 設定をロード
+    let config = Arc::new(Config::load());
+    println!("✓ 設定ファイルをロードしました");
+
+    // 表示リクエスト用チャネル
+    let (tx, rx) = unbounded::<String>();
+
+    // 専用表示スレッドを起動（Wayland接続を1回だけ確立）
+    let config_clone = Arc::clone(&config);
+    std::thread::spawn(move || {
+        if let Err(e) = display_thread(rx, config_clone) {
+            eprintln!("表示スレッドエラー: {}", e);
+        }
+    });
 
     // DBus接続を確立
     let dbus_conn = DbusConnection::new_session()
@@ -39,10 +60,8 @@ fn main() -> Result<()> {
         println!("初期入力メソッド: {}", current);
         *last_input_method.lock().unwrap() = current.clone();
 
-        let display_text = get_display_text(&current);
-        if let Err(e) = std::thread::spawn(move || display_text_overlay(&display_text)).join() {
-            eprintln!("表示エラー: {:?}", e);
-        }
+        let display_text = config.get_display_text(&current);
+        tx.send(display_text).ok();
     }
 
     // fcitx5のプロパティ変更シグナルをマッチ
@@ -58,6 +77,8 @@ fn main() -> Result<()> {
         .with_sender("org.fcitx.Fcitx5");
 
     let last_im_clone = Arc::clone(&last_input_method);
+    let tx_clone = tx.clone();
+    let config_clone = Arc::clone(&config);
     dbus_conn.add_match(rule2, move |_: (), _, _| {
         // 入力メソッドが変更されたかチェック
         if let Ok(current) = get_current_input_method() {
@@ -66,13 +87,8 @@ fn main() -> Result<()> {
                 println!("入力メソッド変更: {} -> {}", *last, current);
                 *last = current.clone();
 
-                let display_text = get_display_text(&current);
-                // 別スレッドで表示（ブロッキングを避ける）
-                std::thread::spawn(move || {
-                    if let Err(e) = display_text_overlay(&display_text) {
-                        eprintln!("表示エラー: {}", e);
-                    }
-                });
+                let display_text = config_clone.get_display_text(&current);
+                tx_clone.send(display_text).ok();
             }
         }
         true
@@ -95,24 +111,159 @@ fn main() -> Result<()> {
                 println!("入力メソッド変更: {} -> {}", *last, current);
                 *last = current.clone();
 
-                let display_text = get_display_text(&current);
-                std::thread::spawn(move || {
-                    if let Err(e) = display_text_overlay(&display_text) {
-                        eprintln!("表示エラー: {}", e);
-                    }
-                });
+                let display_text = config.get_display_text(&current);
+                tx.send(display_text).ok();
             }
         }
     }
 }
 
-/// 入力メソッド名から表示テキストを決定
-fn get_display_text(input_method: &str) -> String {
-    if input_method == "mozc" {
-        "かな".to_string()
-    } else {
-        "en".to_string()
+/// イージング関数（ease-out cubic）
+fn ease_out_cubic(t: f64) -> f64 {
+    let t1 = t - 1.0;
+    t1 * t1 * t1 + 1.0
+}
+
+/// アクティブウィンドウの位置とサイズを取得
+fn get_active_window_geometry() -> Option<(i32, i32, i32, i32)> {
+    // アクティブなウィンドウを取得
+    let active_window = Client::get_active().ok()??;
+
+    let x = active_window.at.0 as i32;
+    let y = active_window.at.1 as i32;
+    let width = active_window.size.0 as i32;
+    let height = active_window.size.1 as i32;
+
+    Some((x, y, width, height))
+}
+
+/// 専用表示スレッド（Wayland接続を1回だけ確立）
+fn display_thread(rx: crossbeam_channel::Receiver<String>, config: Arc<Config>) -> Result<()> {
+    // Waylandコンポジタへの接続（1回だけ）
+    let conn = Connection::connect_to_env()
+        .context("Waylandコンポジタへの接続に失敗")?;
+
+    // イベントキューとグローバルの初期化（1回だけ）
+    let (globals, mut event_queue) = registry_queue_init::<AppState>(&conn)
+        .context("グローバルレジストリの取得に失敗")?;
+
+    let qh = event_queue.handle();
+
+    // 必要なグローバルをバインド（1回だけ）
+    let compositor: wl_compositor::WlCompositor = globals
+        .bind(&qh, 4..=6, ())
+        .context("wl_compositorのバインドに失敗")?;
+
+    let shm: wl_shm::WlShm = globals
+        .bind(&qh, 1..=1, ())
+        .context("wl_shmのバインドに失敗")?;
+
+    let layer_shell: ZwlrLayerShellV1 = globals
+        .bind(&qh, 1..=4, ())
+        .context("zwlr_layer_shell_v1のバインドに失敗")?;
+
+    println!("✓ Wayland接続確立完了");
+
+    // 表示リクエストを処理
+    while let Ok(text) = rx.recv() {
+        if let Err(e) = show_overlay(&compositor, &shm, &layer_shell, &mut event_queue, &qh, &text, &config) {
+            eprintln!("表示エラー: {}", e);
+        }
     }
+
+    Ok(())
+}
+
+/// オーバーレイを表示（Wayland接続を再利用）
+fn show_overlay(
+    compositor: &wl_compositor::WlCompositor,
+    shm: &wl_shm::WlShm,
+    layer_shell: &ZwlrLayerShellV1,
+    event_queue: &mut wayland_client::EventQueue<AppState>,
+    qh: &QueueHandle<AppState>,
+    text: &str,
+    config: &Config,
+) -> Result<()> {
+    // サーフェスの作成
+    let surface = compositor.create_surface(qh, ());
+    let layer_surface = layer_shell.get_layer_surface(
+        &surface,
+        None,
+        zwlr_layer_shell_v1::Layer::Overlay,
+        "modal_ime_indicator".to_string(),
+        qh,
+        (),
+    );
+
+    // 設定からサイズを取得
+    let width = config.overlay.width;
+    let height = config.overlay.height;
+
+    layer_surface.set_size(width, height);
+
+    // アクティブウィンドウの中央に配置
+    if let Some((win_x, win_y, win_width, win_height)) = get_active_window_geometry() {
+        // ウィンドウの中央座標を計算
+        let center_x = win_x + win_width / 2;
+        let center_y = win_y + win_height / 2;
+
+        // オーバーレイの中央がウィンドウの中央になるように位置を調整
+        let margin_left = center_x - (width as i32) / 2;
+        let margin_top = center_y - (height as i32) / 2;
+
+        layer_surface.set_anchor(Anchor::Top | Anchor::Left);
+        layer_surface.set_margin(margin_top, 0, 0, margin_left);
+    } else {
+        // アクティブウィンドウが見つからない場合は画面中央（従来の動作）
+        layer_surface.set_anchor(Anchor::empty());
+    }
+
+    layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
+    layer_surface.set_exclusive_zone(-1);
+
+    // 入力リージョンを空に設定
+    let region = compositor.create_region(qh, ());
+    surface.set_input_region(Some(&region));
+
+    surface.commit();
+
+    // イベントループで設定を待機
+    event_queue.blocking_dispatch(&mut AppState::new())?;
+
+    // 初期表示（即座に表示）
+    let buffer = create_text_buffer(shm, qh, width as i32, height as i32, text, 1.0, config)?;
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage_buffer(0, 0, width as i32, height as i32);
+    surface.commit();
+
+    let mut state = AppState::new();
+    event_queue.roundtrip(&mut state)?;
+
+    // 設定から表示時間を取得
+    std::thread::sleep(Duration::from_millis(config.animation.display_duration_ms));
+
+    // フェードアウトアニメーション（設定から取得）
+    let total_frames = config.animation.fade_frames;
+    let frame_duration = Duration::from_millis(config.animation.fade_duration_ms / total_frames as u64);
+
+    for frame in 1..=total_frames {
+        // イージング関数（ease-out cubic）でスムーズに
+        let t = frame as f64 / total_frames as f64;
+        let alpha = 1.0 - ease_out_cubic(t);
+
+        let buffer = create_text_buffer(shm, qh, width as i32, height as i32, text, alpha, config)?;
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage_buffer(0, 0, width as i32, height as i32);
+        surface.commit();
+        event_queue.roundtrip(&mut state)?;
+        std::thread::sleep(frame_duration);
+    }
+
+    // クリーンアップ
+    layer_surface.destroy();
+    surface.destroy();
+
+    Ok(())
 }
 
 /// fcitx5の現在の入力メソッドをDBusで取得
@@ -135,101 +286,6 @@ fn get_current_input_method() -> Result<String> {
     Ok(input_method)
 }
 
-/// 画面中央にテキストを表示
-fn display_text_overlay(text: &str) -> Result<()> {
-    // Waylandコンポジタへの接続
-    let conn = Connection::connect_to_env()
-        .context("Waylandコンポジタへの接続に失敗")?;
-
-    // イベントキューとグローバルの初期化
-    let (globals, mut event_queue) = registry_queue_init::<AppState>(&conn)
-        .context("グローバルレジストリの取得に失敗")?;
-
-    let qh = event_queue.handle();
-
-    // 必要なグローバルをバインド
-    let compositor: wl_compositor::WlCompositor = globals
-        .bind(&qh, 4..=6, ())
-        .context("wl_compositorのバインドに失敗")?;
-
-    let shm: wl_shm::WlShm = globals
-        .bind(&qh, 1..=1, ())
-        .context("wl_shmのバインドに失敗")?;
-
-    let layer_shell: ZwlrLayerShellV1 = globals
-        .bind(&qh, 1..=4, ())
-        .context("zwlr_layer_shell_v1のバインドに失敗")?;
-
-    // サーフェスの作成
-    let surface = compositor.create_surface(&qh, ());
-    let layer_surface = layer_shell.get_layer_surface(
-        &surface,
-        None,
-        zwlr_layer_shell_v1::Layer::Overlay,
-        "modal_ime_indicator".to_string(),
-        &qh,
-        (),
-    );
-
-    // サイズ設定（テキストに応じて調整）
-    let width = 300;
-    let height = 150;
-
-    layer_surface.set_size(width, height);
-    layer_surface.set_anchor(Anchor::empty()); // 画面中央
-    layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
-    layer_surface.set_exclusive_zone(-1);
-
-    // 入力リージョンを空に設定（マウス/タッチ入力を通過させる）
-    let region = compositor.create_region(&qh, ());
-    surface.set_input_region(Some(&region));
-
-    surface.commit();
-
-    // イベントループで設定を待機
-    event_queue.blocking_dispatch(&mut AppState::new())?;
-
-    // 初期表示（即座に表示）
-    let buffer = create_text_buffer(&shm, &qh, width as i32, height as i32, text, 1.0)
-        .context("テキスト描画バッファの作成に失敗")?;
-
-    surface.attach(Some(&buffer), 0, 0);
-    surface.damage_buffer(0, 0, width as i32, height as i32);
-    surface.commit();
-
-    let mut state = AppState::new();
-    event_queue.roundtrip(&mut state)?;
-
-    // 1秒待機
-    std::thread::sleep(Duration::from_millis(1000));
-
-    // フェードアウトアニメーション（1秒間、10フレーム）
-    let total_frames = 10;
-    let frame_duration = Duration::from_millis(100);
-
-    for frame in 1..=total_frames {
-        // アルファ値を計算（1.0 -> 0.0）
-        let alpha = 1.0 - (frame as f64 / total_frames as f64);
-
-        // バッファを作成
-        let buffer = create_text_buffer(&shm, &qh, width as i32, height as i32, text, alpha)
-            .context("テキスト描画バッファの作成に失敗")?;
-
-        // バッファをサーフェスにアタッチ
-        surface.attach(Some(&buffer), 0, 0);
-        surface.damage_buffer(0, 0, width as i32, height as i32);
-        surface.commit();
-
-        // イベント処理
-        event_queue.roundtrip(&mut state)?;
-
-        // 次のフレームまで待機
-        std::thread::sleep(frame_duration);
-    }
-
-    Ok(())
-}
-
 /// Cairoでテキストを描画した共有メモリバッファを作成
 fn create_text_buffer(
     shm: &wl_shm::WlShm,
@@ -238,6 +294,7 @@ fn create_text_buffer(
     height: i32,
     text: &str,
     alpha: f64,
+    config: &Config,
 ) -> Result<wl_buffer::WlBuffer> {
     let stride = width * 4; // ARGB8888 = 4 bytes per pixel
     let size = stride * height;
@@ -250,39 +307,66 @@ fn create_text_buffer(
     )
     .context("Cairo ImageSurfaceの作成に失敗")?;
 
-    // Cairo描画
+    // Cairo描画（黒背景 + 白い角丸ボックス + 黒文字）
     {
         let cairo_context = cairo::Context::new(&cairo_surface)
             .context("Cairo Contextの作成に失敗")?;
 
-        // 背景を半透明の暗い色で塗りつぶし（alphaを適用）
-        cairo_context.set_source_rgba(0.1, 0.1, 0.1, 0.95 * alpha);
+        // 外側の黒い背景を塗りつぶし
+        cairo_context.set_source_rgba(0.0, 0.0, 0.0, 0.8 * alpha);
         cairo_context.paint().context("背景描画に失敗")?;
 
-        // 角丸の四角形を描画
-        let radius = 20.0;
-        let x = 10.0;
-        let y = 10.0;
-        let w = f64::from(width) - 20.0;
-        let h = f64::from(height) - 20.0;
+        // 内側の白い角丸ボックスを描画
+        let padding = 15.0;
+        let corner_radius = 12.0;
+        let box_x = padding;
+        let box_y = padding;
+        let box_width = f64::from(width) - 2.0 * padding;
+        let box_height = f64::from(height) - 2.0 * padding;
 
+        // 角丸矩形のパスを作成
         cairo_context.new_path();
-        cairo_context.arc(x + w - radius, y + radius, radius, -std::f64::consts::PI / 2.0, 0.0);
-        cairo_context.arc(x + w - radius, y + h - radius, radius, 0.0, std::f64::consts::PI / 2.0);
-        cairo_context.arc(x + radius, y + h - radius, radius, std::f64::consts::PI / 2.0, std::f64::consts::PI);
-        cairo_context.arc(x + radius, y + radius, radius, std::f64::consts::PI, 3.0 * std::f64::consts::PI / 2.0);
+        cairo_context.arc(
+            box_x + box_width - corner_radius,
+            box_y + corner_radius,
+            corner_radius,
+            -std::f64::consts::PI / 2.0,
+            0.0,
+        );
+        cairo_context.arc(
+            box_x + box_width - corner_radius,
+            box_y + box_height - corner_radius,
+            corner_radius,
+            0.0,
+            std::f64::consts::PI / 2.0,
+        );
+        cairo_context.arc(
+            box_x + corner_radius,
+            box_y + box_height - corner_radius,
+            corner_radius,
+            std::f64::consts::PI / 2.0,
+            std::f64::consts::PI,
+        );
+        cairo_context.arc(
+            box_x + corner_radius,
+            box_y + corner_radius,
+            corner_radius,
+            std::f64::consts::PI,
+            3.0 * std::f64::consts::PI / 2.0,
+        );
         cairo_context.close_path();
 
-        cairo_context.set_source_rgba(0.2, 0.2, 0.2, 0.95 * alpha);
-        cairo_context.fill().context("角丸四角形の描画に失敗")?;
+        // 白色で塗りつぶし
+        cairo_context.set_source_rgba(1.0, 1.0, 1.0, 0.95 * alpha);
+        cairo_context.fill().context("角丸ボックス描画に失敗")?;
 
-        // テキストを描画
+        // テキストを描画（設定からフォントサイズを取得）
         cairo_context.select_font_face(
             "Sans",
             cairo::FontSlant::Normal,
             cairo::FontWeight::Bold,
         );
-        cairo_context.set_font_size(64.0);
+        cairo_context.set_font_size(config.overlay.font_size);
 
         // テキストのサイズを測定して中央配置
         let extents = cairo_context.text_extents(text)
@@ -291,8 +375,8 @@ fn create_text_buffer(
         let text_x = (f64::from(width) - extents.width()) / 2.0 - extents.x_bearing();
         let text_y = (f64::from(height) - extents.height()) / 2.0 - extents.y_bearing();
 
-        // テキストを白色で描画（alphaを適用）
-        cairo_context.set_source_rgba(1.0, 1.0, 1.0, alpha);
+        // テキストを黒色で描画
+        cairo_context.set_source_rgba(0.0, 0.0, 0.0, alpha);
         cairo_context.move_to(text_x, text_y);
         cairo_context.show_text(text).context("テキスト描画に失敗")?;
     }
