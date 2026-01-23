@@ -27,6 +27,7 @@
 
           buildInputs = with pkgs; [
             cairo
+            glib
             wayland
             dbus
           ];
@@ -46,15 +47,32 @@
         };
 
         devShells.default = pkgs.mkShell {
-          buildInputs = with pkgs; [
+          nativeBuildInputs = with pkgs; [
             cargo
             rustc
             rust-analyzer
             pkg-config
-            cairo
-            wayland
-            dbus
           ];
+
+          buildInputs = with pkgs; [
+            cairo
+            cairo.dev
+            glib
+            glib.dev
+            wayland
+            wayland.dev
+            dbus
+            dbus.dev
+          ];
+
+          shellHook = ''
+            export PKG_CONFIG_PATH="${pkgs.lib.makeSearchPath "lib/pkgconfig" [
+              pkgs.cairo.dev
+              pkgs.glib.dev
+              pkgs.wayland.dev
+              pkgs.dbus.dev
+            ]}"
+          '';
         };
       }
     ) // {
