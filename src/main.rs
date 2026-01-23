@@ -360,9 +360,9 @@ fn create_text_buffer(
         cairo_context.set_source_rgba(1.0, 1.0, 1.0, 0.95 * alpha);
         cairo_context.fill().context("角丸ボックス描画に失敗")?;
 
-        // テキストを描画（設定からフォントサイズを取得）
+        // テキストを描画（設定からフォントを取得）
         cairo_context.select_font_face(
-            "Sans",
+            &config.overlay.font_family,
             cairo::FontSlant::Normal,
             cairo::FontWeight::Bold,
         );

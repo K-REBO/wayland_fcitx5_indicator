@@ -60,6 +60,7 @@ Fcitx5の入力モードが変更された際に、現在アクティブなウ�
         width: 150,
         height: 150,
         font_size: 70.0,
+        font_family: "IPAGothic",
     ),
     animation: (
         display_duration_ms: 800,

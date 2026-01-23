@@ -10,6 +10,7 @@ Config(
         width: 200,
         height: 100,
         font_size: 48.0,
+        font_family: "IPAGothic",
     ),
 
     // アニメーション設定

@@ -13,6 +13,7 @@ pub struct OverlayConfig {
     pub width: u32,
     pub height: u32,
     pub font_size: f64,
+    pub font_family: String,
 }
 
 #[derive(Debug, Deserialize)]
