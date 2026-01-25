@@ -23,6 +23,7 @@
 
           nativeBuildInputs = with pkgs; [
             pkg-config
+            makeWrapper
           ];
 
           buildInputs = with pkgs; [
@@ -30,7 +31,13 @@
             glib
             wayland
             dbus
+            fontconfig
           ];
+
+          postInstall = ''
+            wrapProgram $out/bin/wayland_fcitx5_indicator \
+              --set FONTCONFIG_FILE ${pkgs.makeFontsConf { fontDirectories = [ pkgs.noto-fonts-cjk-sans ]; }}
+          '';
 
           meta = with pkgs.lib; {
             description = "IME mode indicator for fcitx5";
@@ -95,10 +102,17 @@
               default = null;
               description = "Configuration settings in RON format";
             };
+
+            fonts = lib.mkOption {
+              type = lib.types.listOf lib.types.package;
+              default = [ pkgs.noto-fonts-cjk-sans ];
+              description = "Font packages to make available";
+            };
           };
 
           config = lib.mkIf cfg.enable {
-            home.packages = [ cfg.package ];
+            home.packages = [ cfg.package ] ++ cfg.fonts;
+            fonts.fontconfig.enable = true;
 
             xdg.configFile."wayland_fcitx5_indicator/config.ron" = lib.mkIf (cfg.settings != null) {
               text = builtins.toJSON cfg.settings;
