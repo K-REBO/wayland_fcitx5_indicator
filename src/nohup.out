@@ -1,0 +1,83 @@
+   Compiling wayland_fcitx5_indicator v0.1.0 (/home/bido/projects/wayland_fcitx5_indicator)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 1.31s
+     Running `/home/bido/projects/wayland_fcitx5_indicator/target/debug/wayland_fcitx5_indicator`
+=== fcitx5 IME Mode Indicator (Daemon) ===
+
+fcitx5の入力メソッド変更を監視しています...
+終了するには Ctrl+C を押してください
+
+✓ 設定ファイルをロードしました
+✓ Wayland接続確立完了
+初期入力メソッド: keyboard-us
+✓ DBusシグナル監視を開始しました
+✓ バッファを事前レンダリング: en
+✓ バッファを事前レンダリング: かな
+✓ 初期化完了、表示リクエストを待機中...
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us
+入力メソッド変更: keyboard-us -> mozc
+入力メソッド変更: mozc -> keyboard-us

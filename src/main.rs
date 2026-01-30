@@ -1,10 +1,14 @@
 // IME mode indicator for fcitx5
 // fcitx5の入力モードを画面中央に表示
+// 最適化版: バッファキャッシュ、共有メモリプール再利用
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::ffi::CStr;
 use std::os::fd::AsFd;
 use std::time::Duration;
 use std::sync::{Arc, Mutex};
+use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
 
 // Waylandクライアントライブラリ
 use wayland_client::{
@@ -24,9 +28,110 @@ use dbus::message::MatchRule;
 use crossbeam_channel::unbounded;
 use hyprland::data::Client;
 use hyprland::prelude::*;
+use memmap2::MmapMut;
 
 mod config;
 use config::Config;
+
+/// キャッシュされたバッファ（各アルファ値のピクセルデータを保持）
+struct CachedBuffer {
+    /// アルファ=1.0のピクセルデータ（ARGB8888）
+    pixels_full: Vec<u8>,
+}
+
+impl CachedBuffer {
+    /// 指定アルファ値でピクセルデータを生成
+    fn get_pixels_with_alpha(&self, alpha: f64) -> Vec<u8> {
+        if alpha >= 1.0 {
+            return self.pixels_full.clone();
+        }
+
+        let mut pixels = self.pixels_full.clone();
+        // ARGB8888フォーマット: 各ピクセル4バイト [B, G, R, A]
+        for chunk in pixels.chunks_exact_mut(4) {
+            // Cairoは事前乗算アルファを使用するため、全チャンネルにアルファを適用
+            chunk[0] = (chunk[0] as f64 * alpha) as u8; // B
+            chunk[1] = (chunk[1] as f64 * alpha) as u8; // G
+            chunk[2] = (chunk[2] as f64 * alpha) as u8; // R
+            chunk[3] = (chunk[3] as f64 * alpha) as u8; // A
+        }
+        pixels
+    }
+}
+
+/// バッファキャッシュ（テキストごとにCachedBufferを保持）
+struct BufferCache {
+    cache: HashMap<String, CachedBuffer>,
+    width: i32,
+    height: i32,
+}
+
+impl BufferCache {
+    fn new(width: i32, height: i32) -> Self {
+        Self {
+            cache: HashMap::new(),
+            width,
+            height,
+        }
+    }
+
+    /// テキストのバッファを事前レンダリング
+    fn prerender(&mut self, text: &str, config: &Config) -> Result<()> {
+        if self.cache.contains_key(text) {
+            return Ok(());
+        }
+
+        let pixels = render_text_to_pixels(self.width, self.height, text, 1.0, config)?;
+        self.cache.insert(text.to_string(), CachedBuffer {
+            pixels_full: pixels,
+        });
+        Ok(())
+    }
+
+    /// キャッシュからピクセルデータを取得
+    fn get(&self, text: &str, alpha: f64) -> Option<Vec<u8>> {
+        self.cache.get(text).map(|buf| buf.get_pixels_with_alpha(alpha))
+    }
+}
+
+/// ピクセルデータからWaylandバッファを作成
+fn create_buffer_from_pixels(
+    shm: &wl_shm::WlShm,
+    qh: &QueueHandle<AppState>,
+    width: i32,
+    height: i32,
+    pixels: &[u8],
+) -> Result<wl_buffer::WlBuffer> {
+    let stride = width * 4;
+    let size = stride * height;
+
+    // memfd_create: ディスクI/Oなしの匿名メモリファイル（5-15ms → 1-2ms）
+    let name = CStr::from_bytes_with_nul(b"wl_shm\0").unwrap();
+    let fd = memfd_create(name, MemFdCreateFlag::MFD_CLOEXEC)
+        .context("memfd_createに失敗")?;
+    nix::unistd::ftruncate(&fd, size as i64)
+        .context("ファイルサイズの設定に失敗")?;
+
+    let mut mmap = unsafe {
+        MmapMut::map_mut(&fd)
+            .context("メモリマップに失敗")?
+    };
+    mmap.copy_from_slice(pixels);
+
+    let pool = shm.create_pool(fd.as_fd(), size, qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        width,
+        height,
+        stride,
+        wl_shm::Format::Argb8888,
+        qh,
+        (),
+    );
+    pool.destroy();
+
+    Ok(buffer)
+}
 
 fn main() -> Result<()> {
     println!("=== fcitx5 IME Mode Indicator (Daemon) ===\n");
@@ -137,168 +242,14 @@ fn get_active_window_geometry() -> Option<(i32, i32, i32, i32)> {
     Some((x, y, width, height))
 }
 
-/// 専用表示スレッド（Wayland接続を1回だけ確立）
-fn display_thread(rx: crossbeam_channel::Receiver<String>, config: Arc<Config>) -> Result<()> {
-    // Waylandコンポジタへの接続（1回だけ）
-    let conn = Connection::connect_to_env()
-        .context("Waylandコンポジタへの接続に失敗")?;
-
-    // イベントキューとグローバルの初期化（1回だけ）
-    let (globals, mut event_queue) = registry_queue_init::<AppState>(&conn)
-        .context("グローバルレジストリの取得に失敗")?;
-
-    let qh = event_queue.handle();
-
-    // 必要なグローバルをバインド（1回だけ）
-    let compositor: wl_compositor::WlCompositor = globals
-        .bind(&qh, 4..=6, ())
-        .context("wl_compositorのバインドに失敗")?;
-
-    let shm: wl_shm::WlShm = globals
-        .bind(&qh, 1..=1, ())
-        .context("wl_shmのバインドに失敗")?;
-
-    let layer_shell: ZwlrLayerShellV1 = globals
-        .bind(&qh, 1..=4, ())
-        .context("zwlr_layer_shell_v1のバインドに失敗")?;
-
-    println!("✓ Wayland接続確立完了");
-
-    // 表示リクエストを処理
-    while let Ok(text) = rx.recv() {
-        if let Err(e) = show_overlay(&compositor, &shm, &layer_shell, &mut event_queue, &qh, &text, &config) {
-            eprintln!("表示エラー: {}", e);
-        }
-    }
-
-    Ok(())
-}
-
-/// オーバーレイを表示（Wayland接続を再利用）
-fn show_overlay(
-    compositor: &wl_compositor::WlCompositor,
-    shm: &wl_shm::WlShm,
-    layer_shell: &ZwlrLayerShellV1,
-    event_queue: &mut wayland_client::EventQueue<AppState>,
-    qh: &QueueHandle<AppState>,
-    text: &str,
-    config: &Config,
-) -> Result<()> {
-    // サーフェスの作成
-    let surface = compositor.create_surface(qh, ());
-    let layer_surface = layer_shell.get_layer_surface(
-        &surface,
-        None,
-        zwlr_layer_shell_v1::Layer::Overlay,
-        "modal_ime_indicator".to_string(),
-        qh,
-        (),
-    );
-
-    // 設定からサイズを取得
-    let width = config.overlay.width;
-    let height = config.overlay.height;
-
-    layer_surface.set_size(width, height);
-
-    // アクティブウィンドウの中央に配置
-    if let Some((win_x, win_y, win_width, win_height)) = get_active_window_geometry() {
-        // ウィンドウの中央座標を計算
-        let center_x = win_x + win_width / 2;
-        let center_y = win_y + win_height / 2;
-
-        // オーバーレイの中央がウィンドウの中央になるように位置を調整
-        let margin_left = center_x - (width as i32) / 2;
-        let margin_top = center_y - (height as i32) / 2;
-
-        layer_surface.set_anchor(Anchor::Top | Anchor::Left);
-        layer_surface.set_margin(margin_top, 0, 0, margin_left);
-    } else {
-        // アクティブウィンドウが見つからない場合は画面中央（従来の動作）
-        layer_surface.set_anchor(Anchor::empty());
-    }
-
-    layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
-    layer_surface.set_exclusive_zone(-1);
-
-    // 入力リージョンを空に設定
-    let region = compositor.create_region(qh, ());
-    surface.set_input_region(Some(&region));
-
-    surface.commit();
-
-    // イベントループで設定を待機
-    event_queue.blocking_dispatch(&mut AppState::new())?;
-
-    // 初期表示（即座に表示）
-    let buffer = create_text_buffer(shm, qh, width as i32, height as i32, text, 1.0, config)?;
-    surface.attach(Some(&buffer), 0, 0);
-    surface.damage_buffer(0, 0, width as i32, height as i32);
-    surface.commit();
-
-    let mut state = AppState::new();
-    event_queue.roundtrip(&mut state)?;
-
-    // 設定から表示時間を取得
-    std::thread::sleep(Duration::from_millis(config.animation.display_duration_ms));
-
-    // フェードアウトアニメーション（設定から取得）
-    let total_frames = config.animation.fade_frames;
-    let frame_duration = Duration::from_millis(config.animation.fade_duration_ms / total_frames as u64);
-
-    for frame in 1..=total_frames {
-        // イージング関数（ease-out cubic）でスムーズに
-        let t = frame as f64 / total_frames as f64;
-        let alpha = 1.0 - ease_out_cubic(t);
-
-        let buffer = create_text_buffer(shm, qh, width as i32, height as i32, text, alpha, config)?;
-        surface.attach(Some(&buffer), 0, 0);
-        surface.damage_buffer(0, 0, width as i32, height as i32);
-        surface.commit();
-        event_queue.roundtrip(&mut state)?;
-        std::thread::sleep(frame_duration);
-    }
-
-    // クリーンアップ
-    layer_surface.destroy();
-    surface.destroy();
-
-    Ok(())
-}
-
-/// fcitx5の現在の入力メソッドをDBusで取得
-fn get_current_input_method() -> Result<String> {
-    let conn = dbus::blocking::Connection::new_session()
-        .context("DBusセッションバスへの接続に失敗")?;
-
-    let proxy = conn.with_proxy(
-        "org.fcitx.Fcitx5",
-        "/controller",
-        Duration::from_millis(5000),
-    );
-
-    let (input_method,): (String,) = proxy.method_call(
-        "org.fcitx.Fcitx.Controller1",
-        "CurrentInputMethod",
-        (),
-    ).context("fcitx5から入力メソッドの取得に失敗")?;
-
-    Ok(input_method)
-}
-
-/// Cairoでテキストを描画した共有メモリバッファを作成
-fn create_text_buffer(
-    shm: &wl_shm::WlShm,
-    qh: &QueueHandle<AppState>,
+/// Cairoでテキストを描画してピクセルデータを返す
+fn render_text_to_pixels(
     width: i32,
     height: i32,
     text: &str,
     alpha: f64,
     config: &Config,
-) -> Result<wl_buffer::WlBuffer> {
-    let stride = width * 4; // ARGB8888 = 4 bytes per pixel
-    let size = stride * height;
-
+) -> Result<Vec<u8>> {
     // Cairo ImageSurfaceを作成
     let mut cairo_surface = cairo::ImageSurface::create(
         cairo::Format::ARgb32,
@@ -386,45 +337,190 @@ fn create_text_buffer(
     let cairo_data = cairo_surface.data()
         .context("Cairoデータの取得に失敗")?;
 
-    // 一時ファイルを作成（共有メモリ用）
-    let file = tempfile::tempfile()
-        .context("一時ファイルの作成に失敗")?;
+    Ok(cairo_data.to_vec())
+}
 
-    // ファイルサイズを設定
-    nix::unistd::ftruncate(&file, size as i64)
-        .context("ファイルサイズの設定に失敗")?;
+/// 専用表示スレッド（Wayland接続を1回だけ確立、バッファキャッシュを再利用）
+fn display_thread(rx: crossbeam_channel::Receiver<String>, config: Arc<Config>) -> Result<()> {
+    // Waylandコンポジタへの接続（1回だけ）
+    let conn = Connection::connect_to_env()
+        .context("Waylandコンポジタへの接続に失敗")?;
 
-    // メモリマップ
-    let mut mmap = unsafe {
-        memmap2::MmapMut::map_mut(&file)
-            .context("メモリマップに失敗")?
-    };
+    // イベントキューとグローバルの初期化（1回だけ）
+    let (globals, mut event_queue) = registry_queue_init::<AppState>(&conn)
+        .context("グローバルレジストリの取得に失敗")?;
 
-    // CairoのデータをWaylandバッファにコピー
-    mmap.copy_from_slice(&cairo_data);
+    let qh = event_queue.handle();
 
-    // 共有メモリプールを作成
-    let pool = shm.create_pool(
-        file.as_fd(),
-        size,
+    // 必要なグローバルをバインド（1回だけ）
+    let compositor: wl_compositor::WlCompositor = globals
+        .bind(&qh, 4..=6, ())
+        .context("wl_compositorのバインドに失敗")?;
+
+    let shm: wl_shm::WlShm = globals
+        .bind(&qh, 1..=1, ())
+        .context("wl_shmのバインドに失敗")?;
+
+    let layer_shell: ZwlrLayerShellV1 = globals
+        .bind(&qh, 1..=4, ())
+        .context("zwlr_layer_shell_v1のバインドに失敗")?;
+
+    println!("✓ Wayland接続確立完了");
+
+    let width = config.overlay.width;
+    let height = config.overlay.height;
+
+    // バッファキャッシュを作成
+    let mut buffer_cache = BufferCache::new(width as i32, height as i32);
+
+    // 設定ファイルの入力メソッドを事前レンダリング
+    for display_text in config.input_method_names.values() {
+        buffer_cache.prerender(display_text, &config)?;
+        println!("✓ バッファを事前レンダリング: {}", display_text);
+    }
+
+    println!("✓ 初期化完了、表示リクエストを待機中...");
+
+    // 表示リクエストを処理
+    while let Ok(text) = rx.recv() {
+        // 未キャッシュのテキストは動的にレンダリング
+        if buffer_cache.get(&text, 1.0).is_none() {
+            buffer_cache.prerender(&text, &config)?;
+            println!("✓ バッファを動的レンダリング: {}", text);
+        }
+
+        // オーバーレイを表示（キャッシュされたバッファを使用）
+        if let Err(e) = show_overlay_cached(
+            &compositor,
+            &shm,
+            &layer_shell,
+            &mut event_queue,
+            &qh,
+            &conn,
+            &buffer_cache,
+            &text,
+            width,
+            height,
+            &config,
+        ) {
+            eprintln!("表示エラー: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+/// オーバーレイを表示（キャッシュされたバッファを使用）
+fn show_overlay_cached(
+    compositor: &wl_compositor::WlCompositor,
+    shm: &wl_shm::WlShm,
+    layer_shell: &ZwlrLayerShellV1,
+    event_queue: &mut wayland_client::EventQueue<AppState>,
+    qh: &QueueHandle<AppState>,
+    conn: &Connection,
+    buffer_cache: &BufferCache,
+    text: &str,
+    width: u32,
+    height: u32,
+    config: &Config,
+) -> Result<()> {
+    // サーフェスの作成（毎回新規作成）
+    let surface = compositor.create_surface(qh, ());
+    let layer_surface = layer_shell.get_layer_surface(
+        &surface,
+        None,
+        zwlr_layer_shell_v1::Layer::Overlay,
+        "modal_ime_indicator".to_string(),
         qh,
         (),
     );
 
-    // バッファを作成
-    let buffer = pool.create_buffer(
-        0,
-        width,
-        height,
-        stride,
-        wl_shm::Format::Argb8888,
-        qh,
-        (),
+    layer_surface.set_size(width, height);
+
+    // アクティブウィンドウの中央に配置
+    if let Some((win_x, win_y, win_width, win_height)) = get_active_window_geometry() {
+        let center_x = win_x + win_width / 2;
+        let center_y = win_y + win_height / 2;
+        let margin_left = center_x - (width as i32) / 2;
+        let margin_top = center_y - (height as i32) / 2;
+
+        layer_surface.set_anchor(Anchor::Top | Anchor::Left);
+        layer_surface.set_margin(margin_top, 0, 0, margin_left);
+    } else {
+        // アクティブウィンドウが見つからない場合は画面中央
+        layer_surface.set_anchor(Anchor::empty());
+    }
+
+    layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
+    layer_surface.set_exclusive_zone(-1);
+
+    // 入力リージョンを空に設定
+    let region = compositor.create_region(qh, ());
+    surface.set_input_region(Some(&region));
+
+    surface.commit();
+
+    // configure待機
+    let mut state = AppState::new();
+    event_queue.blocking_dispatch(&mut state)?;
+
+    // 初期表示（キャッシュからピクセルデータを取得）
+    // flush: 非同期送信で即座に表示（5-10ms → <1ms）
+    if let Some(pixels) = buffer_cache.get(text, 1.0) {
+        let buffer = create_buffer_from_pixels(shm, qh, width as i32, height as i32, &pixels)?;
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage_buffer(0, 0, width as i32, height as i32);
+        surface.commit();
+        conn.flush()?;
+    }
+
+    // 表示時間
+    std::thread::sleep(Duration::from_millis(config.animation.display_duration_ms));
+
+    // フェードアウトアニメーション
+    let total_frames = config.animation.fade_frames;
+    let frame_duration = Duration::from_millis(config.animation.fade_duration_ms / total_frames as u64);
+
+    for frame in 1..=total_frames {
+        let t = frame as f64 / total_frames as f64;
+        let alpha = 1.0 - ease_out_cubic(t);
+
+        if let Some(pixels) = buffer_cache.get(text, alpha) {
+            let buffer = create_buffer_from_pixels(shm, qh, width as i32, height as i32, &pixels)?;
+            surface.attach(Some(&buffer), 0, 0);
+            surface.damage_buffer(0, 0, width as i32, height as i32);
+            surface.commit();
+            event_queue.roundtrip(&mut state)?;
+        }
+        std::thread::sleep(frame_duration);
+    }
+
+    // クリーンアップ
+    layer_surface.destroy();
+    surface.destroy();
+    region.destroy();
+
+    Ok(())
+}
+
+/// fcitx5の現在の入力メソッドをDBusで取得
+fn get_current_input_method() -> Result<String> {
+    let conn = dbus::blocking::Connection::new_session()
+        .context("DBusセッションバスへの接続に失敗")?;
+
+    let proxy = conn.with_proxy(
+        "org.fcitx.Fcitx5",
+        "/controller",
+        Duration::from_millis(5000),
     );
 
-    pool.destroy();
+    let (input_method,): (String,) = proxy.method_call(
+        "org.fcitx.Fcitx.Controller1",
+        "CurrentInputMethod",
+        (),
+    ).context("fcitx5から入力メソッドの取得に失敗")?;
 
-    Ok(buffer)
+    Ok(input_method)
 }
 
 // アプリケーション状態（イベントハンドラ用）

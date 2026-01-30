@@ -16,7 +16,7 @@ wayland-protocols = { version = "0.32", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 memmap2 = "0.9"
 nix = { version = "0.29", features = ["fs", "mman"] }
-tempfile = "3"
+# tempfile = "3"  # memfd_createに置き換え
 
 # DBus for fcitx5 monitoring
 dbus = "0.9"
